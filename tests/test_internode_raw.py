@@ -5,8 +5,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
-from utils import init_dist_inter as init_dist
+from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -218,11 +217,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 
 # noinspection PyUnboundLocalVariable
-# def test_loop(local_rank: int, num_local_ranks: int):
-def test_loop():
-    # num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    # rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    rank, num_ranks, group, num_nodes, local_rank, num_local_ranks = init_dist()
+def test_loop(local_rank: int, num_local_ranks: int):
+    num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility = True
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
@@ -251,6 +248,5 @@ def test_loop():
 
 
 if __name__ == '__main__':
-    # num_processes = 8
-    # torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
-    test_loop()
+    num_processes = 8
+    torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)

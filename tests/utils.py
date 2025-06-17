@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from typing import Optional
-
+import socket
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -26,6 +26,51 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
+def parse_slurm_tasks_per_node(tasks_per_node):
+    # 4(x2), 8, ...
+    return int(tasks_per_node.split('(')[0])
+
+def init_dist_inter(local_rank: int = None, num_local_ranks: int = None):
+    # NOTES: you may rewrite this function with your own cluster settings
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '8361'))
+    if os.getenv('SLURM_PROCID', None) is not None:    # Launch with Slurm
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        rank = int(os.environ['SLURM_PROCID'])
+        num_local_ranks = parse_slurm_tasks_per_node(os.environ['SLURM_TASKS_PER_NODE'])
+        node_rank = int(os.environ['SLURM_NODEID'])
+        num_nodes = world_size // num_local_ranks
+        # print(f'[RANK{rank}] local_rank: {local_rank}, world_size: {world_size}, num_local_ranks: {num_local_ranks}, node_rank: {node_rank}, num_nodes: {num_nodes}', flush=True)
+        # ip = os.environ['SLURM_STEP_NODELIST']
+        # hostname = socket.gethostname()
+        # hostip = socket.gethostbyname(hostname)
+        # clustername = os.environ['SLURM_CLUSTER_NAME']
+        # nodename = os.environ['SLURMD_NODENAME']
+    elif 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:  # Launch with OpenMPI
+        local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+        world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
+        rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        num_local_ranks = int(os.environ['OMPI_COMM_WORLD_LOCAL_SIZE'])
+        node_rank = rank // num_local_ranks
+        num_nodes = world_size // num_local_ranks
+        # print(f'[RANK{rank}] In MPI args initialization !!!', flush=True)
+    else:
+        num_nodes = int(os.getenv('WORLD_SIZE', 1))
+        node_rank = int(os.getenv('RANK', 0))
+    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
+
+    dist.init_process_group(
+        backend='nccl',
+        init_method=f'tcp://{ip}:{port}',
+        world_size=num_nodes * num_local_ranks,
+        rank=node_rank * num_local_ranks + local_rank
+    )
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.cuda.set_device(local_rank)
+
+    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes))), num_nodes, local_rank, num_local_ranks
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double() + 1, y.double() + 1

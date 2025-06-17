@@ -23,7 +23,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
-    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
@@ -78,7 +77,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
-        print('', flush=True)
+        print()
     group.barrier()
     time.sleep(1)
 
@@ -130,6 +129,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test cached dispatch (must without top-k staffs)
+                    # NOTES: handle must be refreshed
                     if not with_topk:
                         dispatch_args = {'x': current_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
                         if previous_mode:
@@ -145,7 +145,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
-                        combine_args.update({'previous_event': buffer.capture()})
+                        dispatch_args.update({'previous_event': buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
                     check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
@@ -165,7 +165,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if local_rank == 0:
                         print(' passed', flush=True)
     if local_rank == 0:
-        print('', flush=True)
+        print()
 
     # Tune dispatch performance
     best_dispatch_results = None
@@ -182,10 +182,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                 if t < best_time:
                     best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
                 if local_rank == 0:
-                    print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
+                    print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ')
         if local_rank == 0:
-            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
-            print('', flush=True)
+            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)')
+            print()
 
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
@@ -208,46 +208,38 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.combine(**tune_args))[0]
             if local_rank == 0:
-                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {combine_bf16_rdma_recv_bytes / 1e9 / t:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
+                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {combine_bf16_rdma_recv_bytes / 1e9 / t:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL) ')
                 if t < best_time:
                     best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
 
     if local_rank == 0:
-        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {combine_bf16_rdma_recv_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
-        print('', flush=True)
+        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {combine_bf16_rdma_recv_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL)')
+        print()
 
 
 # noinspection PyUnboundLocalVariable
-# def test_loop(local_rank: int, num_local_ranks: int):
 def test_loop():
+    # Please make sure AR (Adaptive Routing) is turned off when running normal internode kernels,
     # num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    # rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     rank, num_ranks, group, num_nodes, local_rank, num_local_ranks = init_dist()
-    test_ll_compatibility = True
+    test_ll_compatibility = False
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
-
     buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
-                            num_qps_per_rank=num_qps_per_rank)
+                            num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    for i in (num_sms, ):
+    for i in (24, ):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
-            print('', flush=True)
+            print()
 
     # Test compatibility with low latency functions
     if test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
-
-    # Destroy the communication group
-    dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
