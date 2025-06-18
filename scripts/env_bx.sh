@@ -14,7 +14,9 @@ spack load cuda@12.8.1
 
 # conda
 source $USER_ROOT/.local/miniconda3/bin/activate
-conda deactivate && conda deactivate && conda deactivate && conda activate deepep
+conda deactivate && conda deactivate && conda deactivate
+# conda activate deepep
+conda activate comm
 # source /ssd/tianr/miniconda3/bin/activate
 # conda deactivate && conda deactivate && conda deactivate && conda activate sglang-pd
 

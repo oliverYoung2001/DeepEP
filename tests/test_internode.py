@@ -5,16 +5,32 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+from utils import bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, convert_size, convert_throughput, \
+    force_load_balance_router
 from utils import init_dist_inter as init_dist
 
 # Test compatibility with low latency functions
 import test_low_latency
 
+NTs = [
+    2 * 1024,
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    # 32 * 1024,  # OOM
+]
+WARMUP=0
+TIMES=1
+WARMUP=5
+TIMES=10
+CHECK_RESULTS=True
 
-def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
+def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, 
+              num_tokens: int):
+    node_rank = rank // num_local_ranks
     # Settings
-    num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
+    # num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
+    hidden, num_topk_groups, num_topk, num_experts = 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
@@ -24,11 +40,15 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
-    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
-    group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
-    masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
-    topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
+    # group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices # [NT, G_TopK]; [0, EG)
+    # masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+    # topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # num_groups, group_topk = num_ranks, num_ranks
+    # [TODO]: Permute rank and experts here !!! 
+    num_groups, group_topk = num_nodes, num_nodes  # tile along nodes first, along experts_per_rank second, along rank third
+    topk_idx = force_load_balance_router(num_tokens, num_experts, num_topk, num_groups=num_groups, group_topk=group_topk)  # [NT, TopK]; torch.int64
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
     rank_idx = topk_idx // (num_experts // num_ranks)
@@ -41,8 +61,12 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # RDMA dispatch counts
     rdma_idx = topk_idx // (num_experts // num_nodes)
     rdma_idx.masked_fill_(topk_idx == -1, -1)
-    inplace_unique(rdma_idx, num_nodes)
+    inplace_unique(rdma_idx, num_nodes) # [NT, TopK]
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
+    self_rdma_tokens = (rdma_idx == node_rank).sum().item()
+    # if rank == num_ranks - 1:
+    #     print(f'rdma_idx: {rdma_idx.shape}\n{rdma_idx}', flush=True)    # [NT, TopK]
+    #     print(f'[Rank{rank},Node_rank{node_rank}] num_rdma_token_sent={num_rdma_token_sent}, self_rdma_tokens={self_rdma_tokens}', flush=True)
 
     # Expert meta
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
@@ -68,6 +92,12 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     is_token_in_rank = token_idx_in_rank >= 0
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+    num_tokens_rank_to_rank = torch.empty((num_ranks, num_ranks), dtype=torch.int, device='cuda')  # [EP, EP]
+    dist.all_gather_into_tensor(num_tokens_rank_to_rank, num_tokens_per_rank, group=group)
+    self_nvl_tokens = num_tokens_rank_to_rank[local_rank: num_ranks: num_local_ranks, rank].sum().item()
+    all_nvl_recv_tokens = num_tokens_rank_to_rank[:, rank].sum(dim=0)
+    # if rank == num_ranks - 1:
+    #     print(f'[Rank{rank},Node_rank{node_rank}] all_nvl_recv_tokens={all_nvl_recv_tokens}, self_nvl_tokens={self_nvl_tokens}', flush=True)
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
@@ -75,6 +105,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
+    assert torch.allclose(gbl_num_tokens_per_rank, num_tokens_rank_to_rank.sum(dim=0, dtype=gbl_num_tokens_per_rank.dtype))
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
@@ -157,8 +188,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         assert calc_diff(check_topk_weights, ref_topk_weights) < 1e-9
 
                     # For later tuning
-                    dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
-                    dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
+                    # dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
+                    dispatch_bf16_rdma_send_bytes = (num_rdma_token_sent - self_rdma_tokens) * hidden * 2
+                    # dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
+                    dispatch_bf16_nvl_recv_bytes = (recv_x.numel() - self_nvl_tokens * hidden) * 2
+                    assert all_nvl_recv_tokens == recv_x.shape[0], f'(all_nvl_recv_tokens={all_nvl_recv_tokens}) != (recv_x.shape[0]={recv_x.shape[0]})'
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
                     combine_bf16_rdma_recv_bytes = dispatch_bf16_rdma_send_bytes
 
@@ -184,7 +218,14 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                 if local_rank == 0:
                     print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
         if local_rank == 0:
-            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
+            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}, '
+                  f"NUM_TOKEN {convert_size(num_tokens, infix='', suffix='')}, "
+                  f"Rdma_bytes(send) {convert_size(rdma_send_bytes)}, "
+                  f"NVL_bytes(recv) {convert_size(nvl_recv_bytes)}, "
+                  f"Rdma_BW_Bus(send) {convert_throughput(rdma_send_bytes / best_time)}/s (RDMA), "
+                  f"NVL_BW_Bus(recv) {convert_throughput(nvl_recv_bytes / best_time)}/s (NVL), "
+                  f"time/iter {best_time:.3e}s", flush=True)
+                #   {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
             print('', flush=True)
 
         if isinstance(current_x, tuple):
@@ -213,7 +254,14 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
 
     if local_rank == 0:
-        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {combine_bf16_rdma_recv_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
+        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}, '
+              f"NUM_TOKEN {convert_size(num_tokens, infix='', suffix='')}, "
+              f"Rdma_bytes(recv) {convert_size(combine_bf16_rdma_recv_bytes)}, "
+              f"NVL_bytes(send) {convert_size(combine_bf16_nvl_send_bytes)}, "
+              f"Rdma_BW_Bus(recv) {convert_throughput(combine_bf16_rdma_recv_bytes / best_time)}/s (RDMA), "
+              f"NVL_BW_Bus(send) {convert_throughput(combine_bf16_nvl_send_bytes / best_time)}/s (NVL), "
+              f"time/iter {best_time:.3e}s", flush=True)
+            #   {combine_bf16_rdma_recv_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
         print('', flush=True)
 
 
@@ -236,9 +284,10 @@ def test_loop():
     torch.manual_seed(rank)
 
     for i in (num_sms, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
-        if local_rank == 0:
-            print('', flush=True)
+        for NT in NTs:
+            test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, NT)
+            if local_rank == 0:
+                print('', flush=True)
 
     # Test compatibility with low latency functions
     if test_ll_compatibility:

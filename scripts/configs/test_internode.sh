@@ -8,7 +8,9 @@ NNODES=1
 HOST='g0018'
 NNODES=2
 HOST='g[0021,0027]'
-export MASTER_ADDR=g0021
+HOST='g[0009,0018]'
+NNODES=4
+HOST='g[0009,0018,0021,0027]'
 export MASTER_PORT=12321
 
 CPUS=128
@@ -22,4 +24,5 @@ CPU_PER_TASK=$(( CPUS / NPROC_PER_NODE ))   # [NOTE]: Unnecessary for performanc
 export CUDA_DEVICE_MAX_CONNECTIONS=1    # [NOTE]: Important for cc overlap !!!
 
 # Specific settings:
-export NVSHMEM_HCA_LIST=^mlx5_2
+# export NVSHMEM_HCA_LIST=^mlx5_2
+export NVSHMEM_HCA_LIST=mlx5_0,mlx5_1,mlx5_3,mlx5_4

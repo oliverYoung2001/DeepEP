@@ -3,7 +3,7 @@
 # 0. Clone DeepEP repository
 pushd /ssd/yanghy/llm
 git clone git@github.com:oliverYoung2001/DeepEP.git
-git checkout yhy_dev
+git checkout yhy_dev    # Version: 1.1.0+ed4c4fb
 popd
 
 # 1. Install NVSHMEM
@@ -29,7 +29,7 @@ pushd /ssd/yanghy/.local/nvshmem_src_3.2.5-1_deepep
 popd
 
 #   Post-installation configuration
-# Set environment variables in your shell configuration:
+#   Set environment variables in your shell configuration:
 export NVSHMEM_DIR=/ssd/yanghy/.local/nvshmem_src_3.2.5-1_deepep/build/install  # Use for DeepEP installation
 export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:$PATH"

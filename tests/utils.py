@@ -5,6 +5,83 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 import socket
+import math
+from enum import Enum
+import subprocess
+
+class DebugLevel(Enum):
+    OFF = 0
+    ERROR = 1
+    WARN = 2
+    INFO = 3
+    TRACE = 4
+
+    @staticmethod
+    def parse(level_str: str):
+        level_str = (level_str or "").strip().upper()
+        return {
+            "OFF": DebugLevel.OFF,
+            "ERROR": DebugLevel.ERROR,
+            "WARN": DebugLevel.WARN,
+            "INFO": DebugLevel.INFO,
+            "TRACE": DebugLevel.TRACE,
+        }.get(level_str, DebugLevel.OFF)  # 默认 OFF
+        
+def report_memory(name):
+    """Simple GPU memory report."""
+    mega_bytes = 1024.0 * 1024.0
+    string = name + ' memory (MB)'
+    string += ' | allocated: {}'.format(
+        torch.cuda.memory_allocated() / mega_bytes)
+    string += ' | max allocated: {}'.format(
+        torch.cuda.max_memory_allocated() / mega_bytes)
+    string += ' | reserved: {}'.format(
+        torch.cuda.memory_reserved() / mega_bytes)
+    string += ' | max reserved: {}'.format(
+        torch.cuda.max_memory_reserved() / mega_bytes)
+    # if mpu.get_data_parallel_rank() == 0:
+    if torch.distributed.get_rank() == 0:
+        print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
+              flush=True)
+
+
+BYTE_MULTPLE_UP = 1024
+BYTE_MULTPLE_DOWN = 1000
+# Helper function to pretty-print message sizes
+def convert_throughput(size_bytes, round_=3):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+    i = int(math.floor(math.log(size_bytes, BYTE_MULTPLE_DOWN)))
+    p = math.pow(BYTE_MULTPLE_DOWN, i)
+    s = round(size_bytes / p, round_)
+    return "%s %s" % (s, size_name[i])
+
+# Helper function to pretty-print message sizes
+def convert_size(size_bytes, infix=' ', suffix='B'):
+    if size_bytes == 0:
+        return "0" + suffix
+    # size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+    size_name = ("", "K", "M", "G", "T", "P", "E", "Z", "Y")
+    i = int(math.floor(math.log(size_bytes, BYTE_MULTPLE_UP)))
+    p = math.pow(BYTE_MULTPLE_UP, i)
+    # s = int(round(size_bytes / p, 2))
+    # s = round(size_bytes / p, 3)
+    s = size_bytes / p
+    return f"{s:.3g}%s%s%s" % (infix, size_name[i], suffix)
+
+@torch.compile
+def force_load_balance_router(NUM_TOKENS, NUM_EXPERTS, TopK, num_groups, group_topk, dtype=torch.int64):
+    NUM_EXPERTS_PER_GROUP = NUM_EXPERTS // num_groups
+    balance_mod_size = (group_topk // math.gcd(num_groups, group_topk)) * NUM_EXPERTS
+    indices = torch.arange(NUM_TOKENS * TopK, dtype=dtype, device=torch.cuda.current_device()) % balance_mod_size
+    # Do Permutation: (LCM(NUM_GROUP, GROUP_TOPK) // GROUP_TOPK, NE_per_group, GROUP_TOPK) -> (... * NUM_GROUP, NE_per_group)
+    # (idx, idy, idz) -> (idx, idz, idy)
+    idz = indices % group_topk
+    idy = indices // group_topk % NUM_EXPERTS_PER_GROUP
+    idx = indices // (group_topk * NUM_EXPERTS_PER_GROUP)
+    indices = ((((idx * group_topk + idz) * NUM_EXPERTS_PER_GROUP + idy)) % NUM_EXPERTS).view(-1, TopK)
+    return indices  # [NUM_TOKENS, TopK]; [0, NE)
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -26,13 +103,36 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
+def get_master_addr_from_slurm():
+    # 获取 SLURM_JOB_ID（如果未设置，则返回 None）
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        return None
+
+    # 调用 scontrol 获取作业信息并解析第一个节点
+    cmd = "scontrol show JobId=$SLURM_JOB_ID | grep BatchHost | tr '=' ' ' | awk '{print $2}'"
+    try:
+        master_addr = subprocess.run(
+            cmd, shell=True, check=True, 
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        ).stdout.strip()
+        return master_addr
+        # # 提取节点名（如 "BatchHost=node1" -> "node1"）
+        # batch_host_line = result.stdout.strip()
+        # if "=" in batch_host_line:
+        #     master_addr = batch_host_line.split("=")[1].split()[0]
+        #     return master_addr
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to query Slurm: {e.stderr}")
+    return None
+
 def parse_slurm_tasks_per_node(tasks_per_node):
     # 4(x2), 8, ...
     return int(tasks_per_node.split('(')[0])
 
 def init_dist_inter(local_rank: int = None, num_local_ranks: int = None):
     # NOTES: you may rewrite this function with your own cluster settings
-    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    ip = os.getenv('MASTER_ADDR', None)
     port = int(os.getenv('MASTER_PORT', '8361'))
     if os.getenv('SLURM_PROCID', None) is not None:    # Launch with Slurm
         local_rank = int(os.environ['SLURM_LOCALID'])
@@ -47,6 +147,8 @@ def init_dist_inter(local_rank: int = None, num_local_ranks: int = None):
         # hostip = socket.gethostbyname(hostname)
         # clustername = os.environ['SLURM_CLUSTER_NAME']
         # nodename = os.environ['SLURMD_NODENAME']
+        if not ip:
+            ip = get_master_addr_from_slurm()
     elif 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:  # Launch with OpenMPI
         local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
         world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
@@ -58,13 +160,18 @@ def init_dist_inter(local_rank: int = None, num_local_ranks: int = None):
     else:
         num_nodes = int(os.getenv('WORLD_SIZE', 1))
         node_rank = int(os.getenv('RANK', 0))
+    if not ip:
+        ip = '127.0.0.1'
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
+    world_size = num_nodes * num_local_ranks
+    rank = node_rank * num_local_ranks + local_rank
+    # print(f'[Rank{rank}] ip={ip}, port={port}', flush=True)
     dist.init_process_group(
         backend='nccl',
         init_method=f'tcp://{ip}:{port}',
-        world_size=num_nodes * num_local_ranks,
-        rank=node_rank * num_local_ranks + local_rank
+        world_size=world_size,
+        rank=rank,
     )
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
