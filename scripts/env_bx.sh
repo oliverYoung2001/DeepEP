@@ -11,6 +11,7 @@ USER_ROOT=/ssd/yanghy
 # Spack
 source $USER_ROOT/.local/spack/share/spack/setup-env.sh
 spack load cuda@12.8.1
+spack load numactl@2.0.18
 
 # conda
 source $USER_ROOT/.local/miniconda3/bin/activate

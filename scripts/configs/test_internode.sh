@@ -22,7 +22,3 @@ CPU_PER_TASK=$(( CPUS / NPROC_PER_NODE ))   # [NOTE]: Unnecessary for performanc
 # # End
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1    # [NOTE]: Important for cc overlap !!!
-
-# Specific settings:
-# export NVSHMEM_HCA_LIST=^mlx5_2
-export NVSHMEM_HCA_LIST=mlx5_0,mlx5_1,mlx5_3,mlx5_4

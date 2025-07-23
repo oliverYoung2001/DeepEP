@@ -15,7 +15,7 @@ export CLUSTER_NAME=bingxing
 export PLATFORM='H800'
 # Specific settings on BingXing
 # export NVSHMEM_HCA_LIST=^mlx5_2
-export NVSHMEM_HCA_LIST=mlx5_0,mlx5_1,mlx5_3,mlx5_4
+# export NVSHMEM_HCA_LIST=mlx5_0,mlx5_1,mlx5_3,mlx5_4
 # End
 
 source $1   # May overwrite the default settings
@@ -32,6 +32,7 @@ SLURM_ARGS="
 --ntasks-per-node=$NPROC_PER_NODE \
 --gres=gpu:$GPUS_PER_NODE \
 -K \
+--cpu-bind=none \
 "
 if [ "$HOST" != "None" ]; then
     SLURM_ARGS="$SLURM_ARGS \
